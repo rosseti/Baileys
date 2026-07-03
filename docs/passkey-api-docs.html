@@ -389,6 +389,7 @@ a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-
     <div class="mode-tabs" role="tablist">
       <div class="mode-tab active" role="tab" onclick="switchTab('auto', this)">Auto mode</div>
       <div class="mode-tab" role="tab" onclick="switchTab('manual', this)">Manual mode</div>
+      <div class="mode-tab" role="tab" onclick="switchTab('redis', this)">Node.js / Redis</div>
     </div>
 
     <div class="mode-panel active" id="panel-auto">
@@ -498,6 +499,160 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
   console.<span class="fn">error</span>(<span class="str">`Passkey error: <span class="fn">${error}</span>`</span>)
   <span class="cm">// isContinuable is always false in this version</span>
 })</code></pre>
+      </div>
+    </div>
+
+    <div class="mode-panel" id="panel-redis">
+      <p>
+        Um autenticador Node.js headless com Redis — sem browser, sem dependências nativas.
+        Mantém um par de chaves P-256 em um hash Redis e constrói a asserção WebAuthn
+        manualmente via <code>node:crypto</code>. Requer <code>ioredis</code>.
+      </p>
+
+      <div class="callout callout-warn">
+        <div class="callout-label">Pré-requisito</div>
+        <p>
+          O credential deve estar <strong>pré-registrado no WhatsApp</strong> com esse mesmo
+          key pair. Uma chave de software não pode ser extraída de um autenticador de hardware
+          — este padrão serve para desenvolvimento, testes ou deployments controlados onde
+          você controla tanto o registro quanto a asserção.
+        </p>
+      </div>
+
+      <h3>Passo 1 — Criar e persistir o credential</h3>
+      <p>Execute uma vez. O <code>credentialId</code> e <code>publicKeyDer</code> retornados são o que você submete ao WhatsApp durante o fluxo de registro de passkey.</p>
+
+      <div class="codeblock">
+        <div class="codeblock-header">
+          <span class="codeblock-lang">typescript</span>
+          <span class="codeblock-file">redis-authenticator.ts</span>
+        </div>
+        <pre><code><span class="kw">import</span> { createHash, createPrivateKey, generateKeyPairSync, randomBytes, sign } <span class="kw">from</span> <span class="str">'node:crypto'</span>
+<span class="kw">import</span> { <span class="ty">Redis</span> } <span class="kw">from</span> <span class="str">'ioredis'</span>
+<span class="kw">import</span> <span class="kw">type</span> { <span class="ty">PasskeyAssertion</span>, <span class="ty">PasskeyAssertionRequest</span>, <span class="ty">PasskeyAuthenticator</span> } <span class="kw">from</span> <span class="str">'@whiskeysockets/baileys'</span>
+
+<span class="kw">const</span> REDIS_KEY = <span class="str">'baileys:passkey:credential'</span>
+
+<span class="cm">/** Execute uma vez — retorna os dados para registrar o credential no WhatsApp. */</span>
+<span class="kw">export async function</span> <span class="fn">createSoftwareCredential</span>(
+  redis: <span class="ty">Redis</span>,
+  rpId = <span class="str">'web.whatsapp.com'</span>,
+): <span class="ty">Promise</span>&lt;{ credentialId: <span class="ty">Buffer</span>; publicKeyDer: <span class="ty">Buffer</span> }&gt; {
+  <span class="kw">const</span> { privateKey, publicKey } = <span class="fn">generateKeyPairSync</span>(<span class="str">'ec'</span>, { namedCurve: <span class="str">'prime256v1'</span> })
+  <span class="kw">const</span> credentialId = <span class="fn">randomBytes</span>(<span class="num">32</span>)
+
+  <span class="kw">await</span> redis.<span class="fn">hset</span>(REDIS_KEY, {
+    credentialId:  credentialId.<span class="fn">toString</span>(<span class="str">'base64url'</span>),
+    privateKeyPem: privateKey.<span class="fn">export</span>({ type: <span class="str">'pkcs8'</span>, format: <span class="str">'pem'</span> }) <span class="kw">as</span> <span class="ty">string</span>,
+    rpId,
+    counter: <span class="str">'0'</span>,
+  })
+
+  <span class="kw">return</span> {
+    credentialId,
+    publicKeyDer: <span class="ty">Buffer</span>.<span class="fn">from</span>(publicKey.<span class="fn">export</span>({ type: <span class="str">'spki'</span>, format: <span class="str">'der'</span> })),
+  }
+}</code></pre>
+      </div>
+
+      <h3>Passo 2 — Construir o autenticador</h3>
+
+      <div class="codeblock">
+        <div class="codeblock-header">
+          <span class="codeblock-lang">typescript</span>
+          <span class="codeblock-file">redis-authenticator.ts</span>
+        </div>
+        <pre><code><span class="kw">export function</span> <span class="fn">makeRedisPasskeyAuthenticator</span>(redis: <span class="ty">Redis</span>): <span class="ty">PasskeyAuthenticator</span> {
+  <span class="kw">return</span> {
+    <span class="kw">async</span> <span class="fn">getAssertion</span>(request: <span class="ty">PasskeyAssertionRequest</span>): <span class="ty">Promise</span>&lt;<span class="ty">PasskeyAssertion</span>&gt; {
+      <span class="kw">const</span> fields = <span class="kw">await</span> redis.<span class="fn">hgetall</span>(REDIS_KEY)
+      <span class="kw">if</span> (!fields?.credentialId) {
+        <span class="kw">throw new</span> <span class="ty">Error</span>(<span class="str">'Credential não encontrado no Redis. Execute createSoftwareCredential() primeiro.'</span>)
+      }
+
+      <span class="kw">const</span> options = <span class="ty">JSON</span>.<span class="fn">parse</span>(request.rawOptionsJson)
+
+      <span class="cm">// clientDataJSON — espelha o que um browser produziria</span>
+      <span class="kw">const</span> clientDataJSON = <span class="ty">Buffer</span>.<span class="fn">from</span>(<span class="ty">JSON</span>.<span class="fn">stringify</span>({
+        type:        <span class="str">'webauthn.get'</span>,
+        challenge:   options.challenge,  <span class="cm">// base64url, verbatim do WA</span>
+        origin:      <span class="str">`https://<span class="fn">${fields.rpId}</span>`</span>,
+        crossOrigin: <span class="kw">false</span>,
+      }))
+
+      <span class="cm">// authenticatorData: SHA-256(rpId) || flags(1) || counter(4 BE)</span>
+      <span class="kw">const</span> rpIdHash = <span class="fn">createHash</span>(<span class="str">'sha256'</span>).<span class="fn">update</span>(fields.rpId).<span class="fn">digest</span>()
+      <span class="kw">const</span> flags    = <span class="ty">Buffer</span>.<span class="fn">alloc</span>(<span class="num">1</span>, <span class="num">0x05</span>)  <span class="cm">// UP (bit 0) + UV (bit 2)</span>
+      <span class="kw">const</span> counter  = <span class="ty">Buffer</span>.<span class="fn">alloc</span>(<span class="num">4</span>)
+      <span class="kw">const</span> newCounter = <span class="kw">await</span> redis.<span class="fn">hincrby</span>(REDIS_KEY, <span class="str">'counter'</span>, <span class="num">1</span>)  <span class="cm">// atômico</span>
+      counter.<span class="fn">writeUInt32BE</span>(newCounter)
+      <span class="kw">const</span> authenticatorData = <span class="ty">Buffer</span>.<span class="fn">concat</span>([rpIdHash, flags, counter])
+
+      <span class="cm">// ES256: ECDSA-P256-SHA256 sobre authenticatorData || SHA-256(clientDataJSON)</span>
+      <span class="kw">const</span> clientDataHash = <span class="fn">createHash</span>(<span class="str">'sha256'</span>).<span class="fn">update</span>(clientDataJSON).<span class="fn">digest</span>()
+      <span class="kw">const</span> signingData    = <span class="ty">Buffer</span>.<span class="fn">concat</span>([authenticatorData, clientDataHash])
+      <span class="kw">const</span> privateKey     = <span class="fn">createPrivateKey</span>(fields.privateKeyPem)
+      <span class="kw">const</span> signature      = <span class="fn">sign</span>(<span class="str">'SHA256'</span>, signingData, { key: privateKey, dsaEncoding: <span class="str">'der'</span> })
+
+      <span class="kw">return</span> {
+        credentialId:  <span class="ty">Buffer</span>.<span class="fn">from</span>(fields.credentialId, <span class="str">'base64url'</span>),
+        assertionJson: <span class="ty">Buffer</span>.<span class="fn">from</span>(<span class="ty">JSON</span>.<span class="fn">stringify</span>({
+          authenticatorData: authenticatorData.<span class="fn">toString</span>(<span class="str">'base64url'</span>),
+          clientDataJSON:    clientDataJSON.<span class="fn">toString</span>(<span class="str">'base64url'</span>),
+          signature:         signature.<span class="fn">toString</span>(<span class="str">'base64url'</span>),
+        })),
+      }
+    },
+  }
+}</code></pre>
+      </div>
+
+      <h3>Passo 3 — Integrar ao Baileys</h3>
+
+      <div class="codeblock">
+        <div class="codeblock-header">
+          <span class="codeblock-lang">typescript</span>
+          <span class="codeblock-file">my-bot.ts</span>
+        </div>
+        <pre><code><span class="kw">import</span> makeWASocket <span class="kw">from</span> <span class="str">'@whiskeysockets/baileys'</span>
+<span class="kw">import</span> { <span class="ty">Redis</span> } <span class="kw">from</span> <span class="str">'ioredis'</span>
+<span class="kw">import</span> { createSoftwareCredential, makeRedisPasskeyAuthenticator } <span class="kw">from</span> <span class="str">'./redis-authenticator'</span>
+
+<span class="kw">const</span> redis = <span class="kw">new</span> <span class="ty">Redis</span>()
+
+<span class="cm">// Apenas no primeiro run — pula se o credential já existir</span>
+<span class="kw">if</span> (!(<span class="kw">await</span> redis.<span class="fn">exists</span>(<span class="str">'baileys:passkey:credential'</span>))) {
+  <span class="kw">const</span> { credentialId, publicKeyDer } = <span class="kw">await</span> <span class="fn">createSoftwareCredential</span>(redis)
+  console.<span class="fn">log</span>(<span class="str">'Registre este credential no WhatsApp antes de parear:'</span>)
+  console.<span class="fn">log</span>(<span class="str">'  credentialId:'</span>, credentialId.<span class="fn">toString</span>(<span class="str">'base64url'</span>))
+  console.<span class="fn">log</span>(<span class="str">'  publicKey (SPKI DER):'</span>, publicKeyDer.<span class="fn">toString</span>(<span class="str">'base64url'</span>))
+}
+
+<span class="kw">const</span> sock = <span class="fn">makeWASocket</span>({
+  auth: state,
+  passkeyAuthenticator: <span class="fn">makeRedisPasskeyAuthenticator</span>(redis),
+})
+
+sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-confirmation'</span>, ({ code, skipHandoffUx }) =&gt; {
+  <span class="kw">if</span> (!skipHandoffUx) {
+    console.<span class="fn">log</span>(<span class="str">`Confirme no telefone: <span class="fn">${code}</span>`</span>)
+    sock.<span class="fn">confirmPasskeyCode</span>()
+  }
+})
+
+sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</span>, ({ error }) =&gt; {
+  console.<span class="fn">error</span>(<span class="str">`Passkey error: <span class="fn">${error}</span>`</span>)
+})</code></pre>
+      </div>
+
+      <div class="callout callout-tip">
+        <div class="callout-label">Por que Redis para o counter?</div>
+        <p>
+          O counter WebAuthn protege contra replay attacks e precisa ser incrementado
+          atomicamente. <code>HINCRBY</code> é uma operação single-round-trip e segura
+          entre múltiplos processos Baileys concorrentes — diferente de um arquivo em disco
+          que exigiria lock explícito.
+        </p>
       </div>
     </div>
 
