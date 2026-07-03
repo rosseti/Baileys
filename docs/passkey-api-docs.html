@@ -504,23 +504,23 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
 
     <div class="mode-panel" id="panel-redis">
       <p>
-        Um autenticador Node.js headless com Redis — sem browser, sem dependências nativas.
-        Mantém um par de chaves P-256 em um hash Redis e constrói a asserção WebAuthn
-        manualmente via <code>node:crypto</code>. Requer <code>ioredis</code>.
+        A headless Node.js authenticator backed by Redis — no browser, no native dependencies.
+        Stores a P-256 key pair in a Redis hash and builds the WebAuthn assertion manually
+        using <code>node:crypto</code>. Requires <code>ioredis</code>.
       </p>
 
       <div class="callout callout-warn">
-        <div class="callout-label">Pré-requisito</div>
+        <div class="callout-label">Prerequisite</div>
         <p>
-          O credential deve estar <strong>pré-registrado no WhatsApp</strong> com esse mesmo
-          key pair. Uma chave de software não pode ser extraída de um autenticador de hardware
-          — este padrão serve para desenvolvimento, testes ou deployments controlados onde
-          você controla tanto o registro quanto a asserção.
+          The credential must be <strong>pre-registered with WhatsApp</strong> using this
+          same key pair. A software key cannot be extracted from a hardware authenticator —
+          this pattern suits development, testing, or controlled deployments where you own
+          both the registration and the assertion.
         </p>
       </div>
 
-      <h3>Passo 1 — Criar e persistir o credential</h3>
-      <p>Execute uma vez. O <code>credentialId</code> e <code>publicKeyDer</code> retornados são o que você submete ao WhatsApp durante o fluxo de registro de passkey.</p>
+      <h3>Step 1 — Create and store the credential</h3>
+      <p>Run once. The returned <code>credentialId</code> and <code>publicKeyDer</code> are what you submit to WhatsApp during the passkey registration flow.</p>
 
       <div class="codeblock">
         <div class="codeblock-header">
@@ -533,7 +533,7 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
 
 <span class="kw">const</span> REDIS_KEY = <span class="str">'baileys:passkey:credential'</span>
 
-<span class="cm">/** Execute uma vez — retorna os dados para registrar o credential no WhatsApp. */</span>
+<span class="cm">/** Run once — returns the data needed to register the credential with WhatsApp. */</span>
 <span class="kw">export async function</span> <span class="fn">createSoftwareCredential</span>(
   redis: <span class="ty">Redis</span>,
   rpId = <span class="str">'web.whatsapp.com'</span>,
@@ -555,7 +555,7 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
 }</code></pre>
       </div>
 
-      <h3>Passo 2 — Construir o autenticador</h3>
+      <h3>Step 2 — Build the authenticator</h3>
 
       <div class="codeblock">
         <div class="codeblock-header">
@@ -567,15 +567,15 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
     <span class="kw">async</span> <span class="fn">getAssertion</span>(request: <span class="ty">PasskeyAssertionRequest</span>): <span class="ty">Promise</span>&lt;<span class="ty">PasskeyAssertion</span>&gt; {
       <span class="kw">const</span> fields = <span class="kw">await</span> redis.<span class="fn">hgetall</span>(REDIS_KEY)
       <span class="kw">if</span> (!fields?.credentialId) {
-        <span class="kw">throw new</span> <span class="ty">Error</span>(<span class="str">'Credential não encontrado no Redis. Execute createSoftwareCredential() primeiro.'</span>)
+        <span class="kw">throw new</span> <span class="ty">Error</span>(<span class="str">'Credential not found in Redis. Run createSoftwareCredential() first.'</span>)
       }
 
       <span class="kw">const</span> options = <span class="ty">JSON</span>.<span class="fn">parse</span>(request.rawOptionsJson)
 
-      <span class="cm">// clientDataJSON — espelha o que um browser produziria</span>
+      <span class="cm">// clientDataJSON — mirrors what a browser would produce</span>
       <span class="kw">const</span> clientDataJSON = <span class="ty">Buffer</span>.<span class="fn">from</span>(<span class="ty">JSON</span>.<span class="fn">stringify</span>({
         type:        <span class="str">'webauthn.get'</span>,
-        challenge:   options.challenge,  <span class="cm">// base64url, verbatim do WA</span>
+        challenge:   options.challenge,  <span class="cm">// base64url, verbatim from WA</span>
         origin:      <span class="str">`https://<span class="fn">${fields.rpId}</span>`</span>,
         crossOrigin: <span class="kw">false</span>,
       }))
@@ -584,7 +584,7 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
       <span class="kw">const</span> rpIdHash = <span class="fn">createHash</span>(<span class="str">'sha256'</span>).<span class="fn">update</span>(fields.rpId).<span class="fn">digest</span>()
       <span class="kw">const</span> flags    = <span class="ty">Buffer</span>.<span class="fn">alloc</span>(<span class="num">1</span>, <span class="num">0x05</span>)  <span class="cm">// UP (bit 0) + UV (bit 2)</span>
       <span class="kw">const</span> counter  = <span class="ty">Buffer</span>.<span class="fn">alloc</span>(<span class="num">4</span>)
-      <span class="kw">const</span> newCounter = <span class="kw">await</span> redis.<span class="fn">hincrby</span>(REDIS_KEY, <span class="str">'counter'</span>, <span class="num">1</span>)  <span class="cm">// atômico</span>
+      <span class="kw">const</span> newCounter = <span class="kw">await</span> redis.<span class="fn">hincrby</span>(REDIS_KEY, <span class="str">'counter'</span>, <span class="num">1</span>)  <span class="cm">// atomic</span>
       counter.<span class="fn">writeUInt32BE</span>(newCounter)
       <span class="kw">const</span> authenticatorData = <span class="ty">Buffer</span>.<span class="fn">concat</span>([rpIdHash, flags, counter])
 
@@ -607,7 +607,7 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
 }</code></pre>
       </div>
 
-      <h3>Passo 3 — Integrar ao Baileys</h3>
+      <h3>Step 3 — Wire into Baileys</h3>
 
       <div class="codeblock">
         <div class="codeblock-header">
@@ -620,10 +620,10 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
 
 <span class="kw">const</span> redis = <span class="kw">new</span> <span class="ty">Redis</span>()
 
-<span class="cm">// Apenas no primeiro run — pula se o credential já existir</span>
+<span class="cm">// First run only — skip if credential already exists</span>
 <span class="kw">if</span> (!(<span class="kw">await</span> redis.<span class="fn">exists</span>(<span class="str">'baileys:passkey:credential'</span>))) {
   <span class="kw">const</span> { credentialId, publicKeyDer } = <span class="kw">await</span> <span class="fn">createSoftwareCredential</span>(redis)
-  console.<span class="fn">log</span>(<span class="str">'Registre este credential no WhatsApp antes de parear:'</span>)
+  console.<span class="fn">log</span>(<span class="str">'Register this credential with WhatsApp before pairing:'</span>)
   console.<span class="fn">log</span>(<span class="str">'  credentialId:'</span>, credentialId.<span class="fn">toString</span>(<span class="str">'base64url'</span>))
   console.<span class="fn">log</span>(<span class="str">'  publicKey (SPKI DER):'</span>, publicKeyDer.<span class="fn">toString</span>(<span class="str">'base64url'</span>))
 }
@@ -635,7 +635,7 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
 
 sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-confirmation'</span>, ({ code, skipHandoffUx }) =&gt; {
   <span class="kw">if</span> (!skipHandoffUx) {
-    console.<span class="fn">log</span>(<span class="str">`Confirme no telefone: <span class="fn">${code}</span>`</span>)
+    console.<span class="fn">log</span>(<span class="str">`Verify on your phone: <span class="fn">${code}</span>`</span>)
     sock.<span class="fn">confirmPasskeyCode</span>()
   }
 })
@@ -646,12 +646,12 @@ sock.ev.<span class="fn">on</span>(<span class="str">'pairing.passkey-error'</sp
       </div>
 
       <div class="callout callout-tip">
-        <div class="callout-label">Por que Redis para o counter?</div>
+        <div class="callout-label">Why Redis for the counter?</div>
         <p>
-          O counter WebAuthn protege contra replay attacks e precisa ser incrementado
-          atomicamente. <code>HINCRBY</code> é uma operação single-round-trip e segura
-          entre múltiplos processos Baileys concorrentes — diferente de um arquivo em disco
-          que exigiria lock explícito.
+          The WebAuthn counter guards against replay attacks and must be incremented
+          atomically. <code>HINCRBY</code> is a single round-trip and safe across concurrent
+          Baileys processes — unlike a file-based read-modify-write which would require an
+          explicit lock.
         </p>
       </div>
     </div>
