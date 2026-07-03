@@ -1,182 +1,152 @@
 /**
  * passkey-nodes.ts — BinaryNode serialization/deserialization for the Shortcake/PassKey protocol.
  *
- * All tag names and attribute names marked TODO: WIRE_FORMAT are plausible guesses based on
- * whatsapp-rust (jlucaso1) shortcake.rs naming conventions and must be confirmed against the
- * live wire before shipping.
+ * All tag names, xmlns, and node structures confirmed against:
+ * oxidezap/whatsapp-rust src/passkey/flow.rs + wacore/src/shortcake.rs
  */
 
-import { getBinaryNodeChild, getBinaryNodeChildBuffer, getBinaryNodeChildString } from '../WABinary/generic-utils'
+import { getBinaryNodeChild, getBinaryNodeChildBuffer } from '../WABinary/generic-utils'
+import { S_WHATSAPP_NET } from '../WABinary/jid-utils'
 import type { BinaryNode } from '../WABinary/types'
-import type { PasskeyPrologueParams, CrscContinuationData, ShortcakePairingPayload } from '../Types/Passkey'
+import type { PasskeyPrologueParams, CrscContinuationData } from '../Types/Passkey'
+import { proto } from '../../WAProto/index.js'
+
+const XMLNS = 'md'
+
+// ─── Notification: passkey_prologue_request ───────────────────────────────────
 
 /**
- * Extract the WebAuthn request options and challenge ID from a passkey_prologue_request
- * notification.
- *
- * TODO: WIRE_FORMAT — confirm child tag name. Observed in whatsapp-rust as
- * `passkey_request_options` (a JSON string child). The `challenge_id` attr location
- * (notification attr vs. inner child) also needs confirmation against shortcake.rs.
- *
- * Expected structure:
- *   <notification type="passkey_prologue_request" id="...">
- *     <passkey_request_options>{JSON}</passkey_request_options>
- *   </notification>
+ * Try to extract the WebAuthn options JSON from a passkey_prologue_request
+ * notification. Returns null if absent — caller must fetch via buildRequestOptionsQuery().
  */
-export function parsePasskeyPrologueRequest(node: BinaryNode): {
-	requestOptionsJson: string
-	challengeId: string
-} {
-	// TODO: WIRE_FORMAT — tag may be nested under a <passkey> child; confirm depth
-	const optionsNode = getBinaryNodeChild(node, 'passkey_request_options')
-		?? getBinaryNodeChild(getBinaryNodeChild(node, 'passkey'), 'passkey_request_options')
+export function parsePasskeyPrologueRequest(node: BinaryNode): { requestOptionsJson: string | null } {
+	const child = getBinaryNodeChild(node, 'passkey_request_options')
+	if(!child) return { requestOptionsJson: null }
 
-	if(!optionsNode) {
-		throw new Error('passkey_prologue_request: missing <passkey_request_options> child')
-	}
-
-	const requestOptionsJson = getBinaryNodeChildString(node, 'passkey_request_options')
-		?? (typeof optionsNode.content === 'string' ? optionsNode.content : '')
-
-	if(!requestOptionsJson) {
-		throw new Error('passkey_prologue_request: <passkey_request_options> has no text content')
-	}
-
-	// TODO: WIRE_FORMAT — challenge_id may be an attribute on the notification or on the inner node
-	const challengeId = node.attrs['id'] ?? optionsNode.attrs['challenge_id'] ?? ''
-
-	return { requestOptionsJson, challengeId }
+	const { content } = child
+	if(typeof content === 'string') return { requestOptionsJson: content }
+	if(Buffer.isBuffer(content)) return { requestOptionsJson: content.toString('utf8') }
+	if(content instanceof Uint8Array) return { requestOptionsJson: Buffer.from(content).toString('utf8') }
+	return { requestOptionsJson: null }
 }
 
-/**
- * Build the <passkey_prologue> IQ that sends the WebAuthn assertion and our ephemeral commit
- * to the WhatsApp server.
- *
- * TODO: WIRE_FORMAT — confirm xmlns value ('w:auth:passkey' is a guess; may be 'urn:wa:passkey'
- * or 'md'). Confirm child tag names against whatsapp-rust shortcake.rs build_prologue_iq().
- * The <handoff_proof> child is optional and only sent when re-linking.
- *
- * Expected structure:
- *   <iq type="set" xmlns="w:auth:passkey" id="...">
- *     <passkey_prologue>
- *       <credential_id>{base64}</credential_id>
- *       <webauthn_assertion>{JSON bytes}</webauthn_assertion>
- *       <ephemeral_commit>{raw 32 bytes}</ephemeral_commit>
- *       <handoff_proof>{raw 32 bytes}</handoff_proof>  <!-- omitted if undefined -->
- *     </passkey_prologue>
- *   </iq>
- */
-export function buildPasskeyPrologue(params: PasskeyPrologueParams): BinaryNode {
-	const { credentialId, assertionJson, ephemeralCommit, handoffProof } = params
+// ─── GET IQ: <passkey_request_options/> ──────────────────────────────────────
 
-	// TODO: WIRE_FORMAT — confirm child order and tag names
+export function buildRequestOptionsQuery(): BinaryNode {
+	return {
+		tag: 'iq',
+		attrs: { xmlns: XMLNS, type: 'get', to: S_WHATSAPP_NET },
+		content: [{ tag: 'passkey_request_options', attrs: {}, content: undefined }],
+	}
+}
+
+export function parseRequestOptionsResponse(node: BinaryNode): string {
+	const child = getBinaryNodeChild(node, 'passkey_request_options')
+	const { content } = child ?? {}
+	if(typeof content === 'string') return content
+	if(Buffer.isBuffer(content)) return content.toString('utf8')
+	if(content instanceof Uint8Array) return Buffer.from(content).toString('utf8')
+	throw new Error('passkey_request_options response: missing or invalid content')
+}
+
+// ─── GET IQ: <ref/> — fetch server-issued pairing ref ────────────────────────
+
+export function buildRefQuery(): BinaryNode {
+	return {
+		tag: 'iq',
+		attrs: { xmlns: XMLNS, type: 'get', to: S_WHATSAPP_NET },
+		content: [{ tag: 'ref', attrs: {}, content: undefined }],
+	}
+}
+
+export function parseRefResponse(node: BinaryNode): string {
+	const child = getBinaryNodeChild(node, 'ref')
+	const { content } = child ?? {}
+	if(typeof content === 'string') return content
+	if(Buffer.isBuffer(content)) return content.toString('utf8')
+	if(content instanceof Uint8Array) return Buffer.from(content).toString('utf8')
+	throw new Error('passkey ref response: missing or invalid <ref> content')
+}
+
+// ─── SET IQ: <passkey_prologue> ──────────────────────────────────────────────
+
+export function buildPasskeyPrologue(params: PasskeyPrologueParams): BinaryNode {
+	const { credentialId, assertionJson, prologuePayloadBytes, handoffProof } = params
+
 	const children: BinaryNode[] = [
 		{ tag: 'credential_id', attrs: {}, content: credentialId },
 		{ tag: 'webauthn_assertion', attrs: {}, content: assertionJson },
-		{ tag: 'ephemeral_commit', attrs: {}, content: ephemeralCommit },
+		{ tag: 'prologue_payload', attrs: {}, content: prologuePayloadBytes },
 	]
 
 	if(handoffProof) {
-		// TODO: WIRE_FORMAT — tag name may be 'handoff_proof' or 'relink_proof'
-		children.push({ tag: 'handoff_proof', attrs: {}, content: handoffProof })
+		children.push({ tag: 'pairing_handoff_proof', attrs: {}, content: handoffProof })
 	}
 
 	return {
 		tag: 'iq',
-		attrs: {
-			// TODO: WIRE_FORMAT — confirm xmlns
-			xmlns: 'w:auth:passkey',
-			type: 'set',
-		},
-		content: [
-			{
-				tag: 'passkey_prologue',
-				attrs: {},
-				content: children,
-			},
-		],
+		attrs: { xmlns: XMLNS, type: 'set', to: S_WHATSAPP_NET },
+		content: [{ tag: 'passkey_prologue', attrs: {}, content: children }],
 	}
 }
 
+// ─── Notification: crsc_continuation ─────────────────────────────────────────
+
 /**
- * Extract the server's ephemeral public key and handoff-UX flag from a crsc_continuation
- * notification.
- *
- * TODO: WIRE_FORMAT — confirm child tag names against whatsapp-rust shortcake.rs
- * parse_crsc_continuation(). The <skip_handoff_ux> element may instead be an attribute
- * or have a different tag name ('skip_ux', 'no_handoff', etc.).
- *
- * Expected structure:
- *   <notification type="crsc_continuation" id="...">
- *     <ephemeral>{raw 32 bytes}</ephemeral>
- *     <skip_handoff_ux />   <!-- presence signals true; absence signals false -->
- *   </notification>
+ * Extract the server's PrimaryEphemeralIdentity proto from a crsc_continuation
+ * notification. skip_handoff_ux is NOT from the server — computed locally in
+ * PasskeyFlow from whether a pairing_handoff_proof was sent in the prologue.
  */
 export function parseCrscContinuation(node: BinaryNode): CrscContinuationData {
-	// TODO: WIRE_FORMAT — tag may be 'server_ephemeral' or 'ephemeral_pub'
-	const ephemeralBytes = getBinaryNodeChildBuffer(node, 'ephemeral')
-		?? getBinaryNodeChildBuffer(node, 'server_ephemeral')
-
-	if(!ephemeralBytes || ephemeralBytes.length !== 32) {
-		throw new Error(
-			`crsc_continuation: missing or malformed <ephemeral> child (got ${ephemeralBytes?.length ?? 0} bytes, expected 32)`
-		)
+	const rawBytes = getBinaryNodeChildBuffer(node, 'primary_ephemeral_identity')
+	if(!rawBytes) {
+		throw new Error('crsc_continuation: missing <primary_ephemeral_identity> child')
 	}
 
-	// TODO: WIRE_FORMAT — confirm presence-check semantics (child exists = true)
-	const skipHandoffUx = Boolean(getBinaryNodeChild(node, 'skip_handoff_ux'))
+	const identity = proto.PrimaryEphemeralIdentity.decode(Buffer.from(rawBytes))
+
+	if(identity.publicKey?.length !== 32) {
+		throw new Error('crsc_continuation: PrimaryEphemeralIdentity.publicKey missing or wrong length')
+	}
+	if(identity.nonce?.length !== 32) {
+		throw new Error('crsc_continuation: PrimaryEphemeralIdentity.nonce missing or wrong length')
+	}
 
 	return {
-		theirEphemeralPub: Buffer.from(ephemeralBytes),
-		skipHandoffUx,
+		primaryPublicKey: Buffer.from(identity.publicKey),
+		primaryNonce: Buffer.from(identity.nonce),
 	}
 }
 
-/**
- * Build the <encrypted_pairing_request> IQ that delivers the AES-GCM–encrypted identity
- * bundle to the server, along with our revealed ephemeral public key.
- *
- * TODO: WIRE_FORMAT — confirm xmlns and the exact child structure against
- * whatsapp-rust shortcake.rs build_encrypted_pairing_request_iq(). Specifically:
- *   - Whether ephemeral_reveal is the raw 32-byte pub or includes a length prefix
- *   - Whether iv + tag are separate children or concatenated with ciphertext
- *   - Whether there is an outer <passkey> wrapper child
- *
- * Expected structure:
- *   <iq type="set" xmlns="w:auth:passkey" id="...">
- *     <encrypted_pairing_request>
- *       <ephemeral_reveal>{raw 32 bytes}</ephemeral_reveal>
- *       <ciphertext>{encrypted bytes}</ciphertext>
- *       <iv>{12 bytes}</iv>
- *       <tag>{16 bytes}</tag>
- *     </encrypted_pairing_request>
- *   </iq>
- */
-export function buildEncryptedPairingRequestNode(
-	payload: ShortcakePairingPayload,
-	ephemeralPub: Buffer
-): BinaryNode {
-	const { encryptedData, iv, tag } = payload
+// ─── SET IQ: <companion_nonce> ────────────────────────────────────────────────
 
-	// TODO: WIRE_FORMAT — confirm tag names and whether iv/tag are concatenated
+/** Send the companion nonce after crsc_continuation (before encrypting the pairing request). */
+export function buildCompanionNonceQuery(companionNonce: Buffer): BinaryNode {
 	return {
 		tag: 'iq',
-		attrs: {
-			// TODO: WIRE_FORMAT — confirm xmlns
-			xmlns: 'w:auth:passkey',
-			type: 'set',
-		},
-		content: [
-			{
-				tag: 'encrypted_pairing_request',
-				attrs: {},
-				content: [
-					{ tag: 'ephemeral_reveal', attrs: {}, content: ephemeralPub },
-					{ tag: 'ciphertext', attrs: {}, content: encryptedData },
-					{ tag: 'iv', attrs: {}, content: iv },
-					{ tag: 'tag', attrs: {}, content: tag },
-				],
-			},
-		],
+		attrs: { xmlns: XMLNS, type: 'set', to: S_WHATSAPP_NET },
+		content: [{ tag: 'companion_nonce', attrs: {}, content: companionNonce }],
+	}
+}
+
+// ─── SET IQ: <encrypted_pairing_request> ─────────────────────────────────────
+
+/**
+ * Build the final encrypted pairing request IQ.
+ *
+ * The serialized EncryptedPairingRequest proto bytes are sent as the direct
+ * content of the <encrypted_pairing_request> node (no sub-children). The
+ * companion's ephemeral public key is already embedded in the prologue_payload
+ * proto sent earlier — no separate ephemeral_reveal node needed.
+ */
+export function buildEncryptedPairingRequestNode(encryptedPairingRequestBytes: Buffer): BinaryNode {
+	return {
+		tag: 'iq',
+		attrs: { xmlns: XMLNS, type: 'set', to: S_WHATSAPP_NET },
+		content: [{
+			tag: 'encrypted_pairing_request',
+			attrs: {},
+			content: encryptedPairingRequestBytes,
+		}],
 	}
 }

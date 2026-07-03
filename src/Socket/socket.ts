@@ -61,6 +61,7 @@ import { BinaryInfo } from '../WAM/BinaryInfo.js'
 import { USyncQuery, USyncUser } from '../WAUSync/'
 import { WebSocketClient } from './Client'
 import { executeWMexQuery } from './mex.js'
+import { makePasskeyHandlers } from './passkey-handlers'
 
 /**
  * Connects to WA servers and performs:
@@ -380,6 +381,15 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	const ev = makeEventBuffer(logger)
+
+	const passkeyHandlers = makePasskeyHandlers({
+		ev,
+		sendNode,
+		query,
+		authState,
+		passkeyAuthenticator: config.passkeyAuthenticator,
+		logger,
+	})
 
 	const { creds } = authState
 	// add transaction capability
@@ -909,6 +919,14 @@ export const makeSocket = (config: SocketConfig) => {
 
 		genPairQR()
 	})
+	// PassKey/Shortcake pairing notifications
+	ws.on('CB:notification,type:passkey_prologue_request', (stanza: BinaryNode) => {
+		void passkeyHandlers.handlePrologueRequest(stanza)
+	})
+	ws.on('CB:notification,type:crsc_continuation', (stanza: BinaryNode) => {
+		void passkeyHandlers.handleCrscContinuation(stanza)
+	})
+
 	// device paired for the first time
 	// if device pairs successfully, the server asks to restart the connection
 	ws.on('CB:iq,,pair-success', async (stanza: BinaryNode) => {
@@ -924,6 +942,9 @@ export const makeSocket = (config: SocketConfig) => {
 
 			ev.emit('creds.update', updatedCreds)
 			ev.emit('connection.update', { isNewLogin: true, qr: undefined })
+
+			// Clean up any active passkey flow (idempotent no-op for QR/pair-code paths)
+			passkeyHandlers.onPairSuccess()
 
 			await sendNode(reply)
 			void sendUnifiedSession()
@@ -1185,7 +1206,10 @@ export const makeSocket = (config: SocketConfig) => {
 		executeUSyncQuery,
 		onWhatsApp,
 		fetchAccountReachoutTimelock,
-		fetchNewChatMessageCap
+		fetchNewChatMessageCap,
+		sendPasskeyAssertion: passkeyHandlers.sendPasskeyAssertion,
+		confirmPasskeyCode: passkeyHandlers.confirmPasskeyCode,
+		cancelPasskeyPairing: passkeyHandlers.cancelPasskeyPairing,
 	}
 }
 

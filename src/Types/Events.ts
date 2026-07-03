@@ -22,6 +22,12 @@ export type BaileysEventMap = {
 	'connection.update': Partial<ConnectionState>
 	/** credentials updated -- some metadata, keys or something */
 	'creds.update': Partial<AuthenticationCreds>
+	/** PassKey/Shortcake pairing: server requests a WebAuthn assertion (manual-mode only) */
+	'pairing.passkey-request': { requestOptionsJson: string; deviceId: string }
+	/** PassKey/Shortcake pairing: DH exchange complete; show verification code to user */
+	'pairing.passkey-confirmation': { code: string; skipHandoffUx: boolean }
+	/** PassKey/Shortcake pairing: flow failed or was cancelled */
+	'pairing.passkey-error': { error: string; isContinuable: boolean }
 	/** set chats (history sync), everything is reverse chronologically sorted */
 	'messaging-history.set': {
 		chats: Chat[]

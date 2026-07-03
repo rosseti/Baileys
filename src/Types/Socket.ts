@@ -3,6 +3,7 @@ import type { URL } from 'url'
 import { proto } from '../../WAProto/index.js'
 import type { ILogger } from '../Utils/logger'
 import type { AuthenticationState, LIDMapping, SignalAuthState, TransactionCapabilityOptions } from './Auth'
+import type { PasskeyAuthenticator } from './Passkey'
 import type { GroupMetadata } from './GroupMetadata'
 import { type MediaConnInfo, type WAMessageKey } from './Message'
 import type { SignalRepositoryWithLIDStore } from './Signal'
@@ -150,4 +151,7 @@ export type SocketConfig = {
 		logger: ILogger,
 		pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>
 	) => SignalRepositoryWithLIDStore
+
+	/** Optional. When provided, enables automatic PassKey/Shortcake companion pairing. */
+	passkeyAuthenticator?: PasskeyAuthenticator
 }

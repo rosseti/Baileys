@@ -1,16 +1,24 @@
+import { randomBytes } from 'node:crypto'
 import {
+	buildCompanionEphemeralIdentity,
+	buildProloguePayload,
 	completeShortcakeState,
-	computeCommit,
+	computeCommitmentHash,
 	computeHandoffProof,
 	decryptPairingResponse,
-	deriveKeys,
+	deriveEncryptionKey,
+	deriveHandoffKey,
 	deriveSharedSecret,
+	deriveVerificationCode,
 	encryptPairingRequest,
-	formatVerificationCode,
 	generateEphemeralKeyPair,
 	initShortcakeState,
 	rotateAdvSecretKey,
 } from './shortcake'
+import { proto } from '../../WAProto/index.js'
+
+const DEVICE_TYPE = proto.DeviceProps.PlatformType.CHROME
+const REF = 'test-ref-abc'
 
 describe('generateEphemeralKeyPair', () => {
 	it('returns 32-byte raw public and private keys', () => {
@@ -28,23 +36,64 @@ describe('generateEphemeralKeyPair', () => {
 	})
 })
 
-describe('computeCommit', () => {
-	it('returns a 32-byte SHA-256 of the public key', () => {
+describe('buildCompanionEphemeralIdentity', () => {
+	it('returns non-empty bytes containing the public key', () => {
 		const { publicKey } = generateEphemeralKeyPair()
-		const commit = computeCommit(publicKey)
+		const bytes = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		expect(bytes).toBeInstanceOf(Buffer)
+		expect(bytes.length).toBeGreaterThan(32)
+	})
+
+	it('is deterministic', () => {
+		const { publicKey } = generateEphemeralKeyPair()
+		const a = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		const b = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		expect(a.equals(b)).toBe(true)
+	})
+
+	it('differs for different device types', () => {
+		const { publicKey } = generateEphemeralKeyPair()
+		const a = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		const b = buildCompanionEphemeralIdentity(publicKey, proto.DeviceProps.PlatformType.DESKTOP, REF)
+		expect(a.equals(b)).toBe(false)
+	})
+})
+
+describe('computeCommitmentHash', () => {
+	it('returns 32 bytes', () => {
+		const { publicKey } = generateEphemeralKeyPair()
+		const identityBytes = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		const nonce = randomBytes(32)
+		const commit = computeCommitmentHash(identityBytes, nonce)
 		expect(commit).toBeInstanceOf(Buffer)
 		expect(commit.length).toBe(32)
 	})
 
 	it('is deterministic', () => {
 		const { publicKey } = generateEphemeralKeyPair()
-		expect(computeCommit(publicKey).equals(computeCommit(publicKey))).toBe(true)
+		const identityBytes = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		const nonce = randomBytes(32)
+		expect(computeCommitmentHash(identityBytes, nonce).equals(computeCommitmentHash(identityBytes, nonce))).toBe(true)
 	})
 
-	it('differs for different public keys', () => {
-		const a = generateEphemeralKeyPair()
-		const b = generateEphemeralKeyPair()
-		expect(computeCommit(a.publicKey).equals(computeCommit(b.publicKey))).toBe(false)
+	it('differs when nonce changes', () => {
+		const { publicKey } = generateEphemeralKeyPair()
+		const identityBytes = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		const a = computeCommitmentHash(identityBytes, randomBytes(32))
+		const b = computeCommitmentHash(identityBytes, randomBytes(32))
+		expect(a.equals(b)).toBe(false)
+	})
+})
+
+describe('buildProloguePayload', () => {
+	it('returns a non-empty serialized proto', () => {
+		const { publicKey } = generateEphemeralKeyPair()
+		const identityBytes = buildCompanionEphemeralIdentity(publicKey, DEVICE_TYPE, REF)
+		const nonce = randomBytes(32)
+		const commit = computeCommitmentHash(identityBytes, nonce)
+		const payload = buildProloguePayload(identityBytes, commit)
+		expect(payload).toBeInstanceOf(Buffer)
+		expect(payload.length).toBeGreaterThan(0)
 	})
 })
 
@@ -61,43 +110,94 @@ describe('deriveSharedSecret — Diffie-Hellman symmetry', () => {
 	})
 })
 
-describe('deriveKeys', () => {
-	it('returns two independent 32-byte keys', () => {
-		const { publicKey } = generateEphemeralKeyPair()
-		const { encryptionKey, verificationKey } = deriveKeys(publicKey)
-		expect(encryptionKey.length).toBe(32)
-		expect(verificationKey.length).toBe(32)
-		expect(encryptionKey.equals(verificationKey)).toBe(false)
+describe('deriveEncryptionKey', () => {
+	it('returns 32 bytes', () => {
+		const secret = randomBytes(32)
+		const key = deriveEncryptionKey(secret, DEVICE_TYPE, REF)
+		expect(key).toBeInstanceOf(Buffer)
+		expect(key.length).toBe(32)
 	})
 
-	it('accepts an optional info buffer', () => {
-		const secret = generateEphemeralKeyPair().publicKey
-		const { encryptionKey: k1 } = deriveKeys(secret)
-		const { encryptionKey: k2 } = deriveKeys(secret, Buffer.from('custom_info'))
-		expect(k1.equals(k2)).toBe(false)
+	it('differs for different device types', () => {
+		const secret = randomBytes(32)
+		const a = deriveEncryptionKey(secret, proto.DeviceProps.PlatformType.CHROME, REF)
+		const b = deriveEncryptionKey(secret, proto.DeviceProps.PlatformType.DESKTOP, REF)
+		expect(a.equals(b)).toBe(false)
+	})
+
+	it('differs for different ref strings', () => {
+		const secret = randomBytes(32)
+		const a = deriveEncryptionKey(secret, DEVICE_TYPE, 'ref-a')
+		const b = deriveEncryptionKey(secret, DEVICE_TYPE, 'ref-b')
+		expect(a.equals(b)).toBe(false)
+	})
+
+	it('companion and primary derive the same key from a DH exchange', () => {
+		const companion = generateEphemeralKeyPair()
+		const primary = generateEphemeralKeyPair()
+
+		const companionKey = deriveEncryptionKey(
+			deriveSharedSecret(companion.privateKey, primary.publicKey), DEVICE_TYPE, REF
+		)
+		const primaryKey = deriveEncryptionKey(
+			deriveSharedSecret(primary.privateKey, companion.publicKey), DEVICE_TYPE, REF
+		)
+
+		expect(companionKey.equals(primaryKey)).toBe(true)
 	})
 })
 
-describe('formatVerificationCode', () => {
-	it('matches the DDDD-DDDD pattern', () => {
-		const { verificationKey } = deriveKeys(generateEphemeralKeyPair().publicKey)
-		const code = formatVerificationCode(verificationKey)
-		expect(code).toMatch(/^\d{4}-\d{4}$/)
+describe('deriveVerificationCode', () => {
+	it('returns exactly 8 Crockford base32 characters', () => {
+		const companionNonce = randomBytes(32)
+		const primaryPub = generateEphemeralKeyPair().publicKey
+		const primaryNonce = randomBytes(32)
+		const code = deriveVerificationCode(companionNonce, primaryPub, primaryNonce)
+		expect(code).toHaveLength(8)
+		expect(code).toMatch(/^[0-9A-HJKMNP-TV-Z]{8}$/)
 	})
 
-	it('is deterministic for the same input', () => {
-		const { verificationKey } = deriveKeys(generateEphemeralKeyPair().publicKey)
-		expect(formatVerificationCode(verificationKey)).toBe(formatVerificationCode(verificationKey))
+	it('is deterministic', () => {
+		const companionNonce = randomBytes(32)
+		const primaryPub = generateEphemeralKeyPair().publicKey
+		const primaryNonce = randomBytes(32)
+		expect(deriveVerificationCode(companionNonce, primaryPub, primaryNonce))
+			.toBe(deriveVerificationCode(companionNonce, primaryPub, primaryNonce))
+	})
+
+	it('differs when any input changes', () => {
+		const cn = randomBytes(32)
+		const pub = generateEphemeralKeyPair().publicKey
+		const pn = randomBytes(32)
+		const base = deriveVerificationCode(cn, pub, pn)
+		expect(deriveVerificationCode(randomBytes(32), pub, pn)).not.toBe(base)
+		expect(deriveVerificationCode(cn, generateEphemeralKeyPair().publicKey, pn)).not.toBe(base)
+		expect(deriveVerificationCode(cn, pub, randomBytes(32))).not.toBe(base)
 	})
 })
 
-describe('computeHandoffProof', () => {
-	it('returns a 32-byte HMAC', () => {
+describe('deriveHandoffKey + computeHandoffProof', () => {
+	it('handoff key is 32 bytes', () => {
 		const prevAdv = rotateAdvSecretKey()
-		const context = generateEphemeralKeyPair().publicKey
-		const proof = computeHandoffProof(prevAdv, context)
+		const key = deriveHandoffKey(prevAdv)
+		expect(key).toBeInstanceOf(Buffer)
+		expect(key.length).toBe(32)
+	})
+
+	it('handoff proof is a 32-byte HMAC over the prologue payload', () => {
+		const prevAdv = rotateAdvSecretKey()
+		const handoffKey = deriveHandoffKey(prevAdv)
+		const prologuePayload = randomBytes(64)
+		const proof = computeHandoffProof(handoffKey, prologuePayload)
 		expect(proof).toBeInstanceOf(Buffer)
 		expect(proof.length).toBe(32)
+	})
+
+	it('different prologue payloads → different proofs', () => {
+		const handoffKey = deriveHandoffKey(rotateAdvSecretKey())
+		const a = computeHandoffProof(handoffKey, randomBytes(64))
+		const b = computeHandoffProof(handoffKey, randomBytes(64))
+		expect(a.equals(b)).toBe(false)
 	})
 })
 
@@ -115,41 +215,42 @@ describe('rotateAdvSecretKey', () => {
 
 describe('encryptPairingRequest / decryptPairingResponse', () => {
 	it('round-trip returns original plaintext', () => {
-		const { encryptionKey } = deriveKeys(generateEphemeralKeyPair().publicKey)
+		const key = deriveEncryptionKey(randomBytes(32), DEVICE_TYPE, REF)
 		const plaintext = Buffer.from('hello shortcake world')
-		const payload = encryptPairingRequest(encryptionKey, plaintext)
+		const payload = encryptPairingRequest(key, plaintext)
 
 		expect(payload.iv.length).toBe(12)
 		expect(payload.tag.length).toBe(16)
 		expect(payload.encryptedData.equals(plaintext)).toBe(false)
 
-		const decrypted = decryptPairingResponse(encryptionKey, payload)
+		const decrypted = decryptPairingResponse(key, payload)
 		expect(decrypted.equals(plaintext)).toBe(true)
 	})
 
 	it('rejects tampered ciphertext', () => {
-		const { encryptionKey } = deriveKeys(generateEphemeralKeyPair().publicKey)
-		const payload = encryptPairingRequest(encryptionKey, Buffer.from('secret'))
+		const key = deriveEncryptionKey(randomBytes(32), DEVICE_TYPE, REF)
+		const payload = encryptPairingRequest(key, Buffer.from('secret'))
 		payload.encryptedData.writeUInt8(payload.encryptedData.readUInt8(0) ^ 0xff, 0)
-		expect(() => decryptPairingResponse(encryptionKey, payload)).toThrow()
+		expect(() => decryptPairingResponse(key, payload)).toThrow()
 	})
 
 	it('produces different IVs on each encrypt call', () => {
-		const { encryptionKey } = deriveKeys(generateEphemeralKeyPair().publicKey)
-		const p1 = encryptPairingRequest(encryptionKey, Buffer.from('data'))
-		const p2 = encryptPairingRequest(encryptionKey, Buffer.from('data'))
+		const key = deriveEncryptionKey(randomBytes(32), DEVICE_TYPE, REF)
+		const p1 = encryptPairingRequest(key, Buffer.from('data'))
+		const p2 = encryptPairingRequest(key, Buffer.from('data'))
 		expect(p1.iv.equals(p2.iv)).toBe(false)
 	})
 })
 
 describe('initShortcakeState', () => {
 	it('without prevAdvSecretKey — handoffProof is undefined', () => {
-		const state = initShortcakeState()
+		const state = initShortcakeState(DEVICE_TYPE, REF)
 		expect(state.ephemeralKeyPair.publicKey.length).toBe(32)
+		expect(state.companionNonce.length).toBe(32)
 		expect(state.ephemeralCommit.length).toBe(32)
-		expect(state.rotatedAdvSecretKey!.length).toBe(32)
+		expect(state.prologuePayloadBytes.length).toBeGreaterThan(0)
+		expect(state.rotatedAdvSecretKey.length).toBe(32)
 		expect(state.handoffProof).toBeUndefined()
-		// partial state — shared secret not yet derived
 		expect(state.sharedSecret).toBeUndefined()
 		expect(state.encryptionKey).toBeUndefined()
 		expect(state.verificationCode).toBeUndefined()
@@ -157,47 +258,52 @@ describe('initShortcakeState', () => {
 
 	it('with prevAdvSecretKey — handoffProof is a 32-byte Buffer', () => {
 		const prevAdv = rotateAdvSecretKey()
-		const state = initShortcakeState(prevAdv)
+		const state = initShortcakeState(DEVICE_TYPE, REF, prevAdv)
 		expect(state.handoffProof).toBeInstanceOf(Buffer)
 		expect(state.handoffProof!.length).toBe(32)
 	})
 
-	it('commit equals SHA-256 of ephemeral public key', () => {
-		const state = initShortcakeState()
-		const expected = computeCommit(state.ephemeralKeyPair.publicKey)
+	it('ephemeralCommit equals SHA-256(identityBytes || nonce)', () => {
+		const state = initShortcakeState(DEVICE_TYPE, REF)
+		const expected = computeCommitmentHash(state.companionEphemeralIdentityBytes, state.companionNonce)
 		expect(state.ephemeralCommit.equals(expected)).toBe(true)
 	})
 })
 
 describe('completeShortcakeState', () => {
-	it('produces a non-empty verificationCode in DDDD-DDDD format', () => {
-		const alice = initShortcakeState()
-		const bob = initShortcakeState()
+	it('companion and primary derive the same encryption key', () => {
+		const companionState = initShortcakeState(DEVICE_TYPE, REF)
+		const primaryKp = generateEphemeralKeyPair()
+		const primaryNonce = randomBytes(32)
 
-		const aliceComplete = completeShortcakeState(alice, bob.ephemeralKeyPair.publicKey)
-		const bobComplete = completeShortcakeState(bob, alice.ephemeralKeyPair.publicKey)
+		const completed = completeShortcakeState(companionState, primaryKp.publicKey, primaryNonce)
 
-		expect(aliceComplete.verificationCode).toMatch(/^\d{4}-\d{4}$/)
-		expect(aliceComplete.verificationCode).toBe(bobComplete.verificationCode)
+		// Primary's side: raw DH then HKDF with same salt
+		const primaryEncKey = deriveEncryptionKey(
+			deriveSharedSecret(primaryKp.privateKey, companionState.ephemeralKeyPair.publicKey),
+			DEVICE_TYPE,
+			REF,
+		)
+
+		expect(completed.encryptionKey!.equals(primaryEncKey)).toBe(true)
 	})
 
-	it('Alice and Bob derive the same encryption key', () => {
-		const alice = initShortcakeState()
-		const bob = initShortcakeState()
+	it('verification code is 8 Crockford chars', () => {
+		const companionState = initShortcakeState(DEVICE_TYPE, REF)
+		const primaryKp = generateEphemeralKeyPair()
+		const primaryNonce = randomBytes(32)
 
-		const aliceComplete = completeShortcakeState(alice, bob.ephemeralKeyPair.publicKey)
-		const bobComplete = completeShortcakeState(bob, alice.ephemeralKeyPair.publicKey)
-
-		expect(aliceComplete.encryptionKey!.equals(bobComplete.encryptionKey!)).toBe(true)
+		const completed = completeShortcakeState(companionState, primaryKp.publicKey, primaryNonce)
+		expect(completed.verificationCode).toMatch(/^[0-9A-HJKMNP-TV-Z]{8}$/)
 	})
 
 	it('preserves original state fields', () => {
-		const state = initShortcakeState()
-		const peer = generateEphemeralKeyPair()
-		const completed = completeShortcakeState(state, peer.publicKey)
+		const state = initShortcakeState(DEVICE_TYPE, REF)
+		const primaryKp = generateEphemeralKeyPair()
+		const completed = completeShortcakeState(state, primaryKp.publicKey, randomBytes(32))
 
 		expect(completed.ephemeralKeyPair).toBe(state.ephemeralKeyPair)
 		expect(completed.ephemeralCommit.equals(state.ephemeralCommit)).toBe(true)
-		expect(completed.rotatedAdvSecretKey?.equals(state.rotatedAdvSecretKey!)).toBe(true)
+		expect(completed.rotatedAdvSecretKey.equals(state.rotatedAdvSecretKey)).toBe(true)
 	})
 })
