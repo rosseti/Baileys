@@ -154,4 +154,7 @@ export type SocketConfig = {
 
 	/** Optional. When provided, enables automatic PassKey/Shortcake companion pairing. */
 	passkeyAuthenticator?: PasskeyAuthenticator
+
+	/** When set, use phone link-code pairing instead of QR on pair-device IQ. */
+	linkPhoneNumber?: string
 }
