@@ -1128,6 +1128,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 				break
 			case 'link_code_companion_reg':
+				logger.info(
+					{ jid: authState.creds.me?.id, code: authState.creds.pairingCode },
+					'link-code entered on phone — processing companion_reg'
+				)
 				const linkCodeCompanionReg = getBinaryNodeChild(node, 'link_code_companion_reg')
 				const ref = toRequiredBuffer(getBinaryNodeChildBuffer(linkCodeCompanionReg, 'link_code_pairing_ref'))
 				const primaryIdentityPublicKey = toRequiredBuffer(

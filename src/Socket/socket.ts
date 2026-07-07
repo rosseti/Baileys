@@ -400,6 +400,7 @@ export const makeSocket = (config: SocketConfig) => {
 	let epoch = 1
 	let keepAliveReq: NodeJS.Timeout
 	let qrTimer: NodeJS.Timeout
+	let linkCodePairingActive = false
 	let closed = false
 
 	const socketEndHandlers: Array<(error: Error | undefined) => void | Promise<void>> = []
@@ -643,6 +644,7 @@ export const makeSocket = (config: SocketConfig) => {
 		closed = true
 		logger.info({ trace: error?.stack }, error ? 'connection errored' : 'connection closed')
 
+		linkCodePairingActive = false
 		clearInterval(keepAliveReq)
 		clearTimeout(qrTimer)
 
@@ -772,6 +774,9 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	const requestPairingCode = async (phoneNumber: string, customPairingCode?: string): Promise<string> => {
+		linkCodePairingActive = true
+		clearTimeout(qrTimer)
+
 		const pairingCode = customPairingCode ?? bytesToCrockford(randomBytes(5))
 
 		if (customPairingCode && customPairingCode?.length !== 8) {
@@ -890,6 +895,23 @@ export const makeSocket = (config: SocketConfig) => {
 		}
 		await sendNode(iq)
 
+		if (config.linkPhoneNumber) {
+			linkCodePairingActive = true
+			try {
+				const code = await requestPairingCode(config.linkPhoneNumber)
+				logger.info({ code, phone: config.linkPhoneNumber }, 'link-code pairing requested via pair-device')
+			} catch (err) {
+				logger.error({ err }, 'failed to request link-code pairing')
+				void end(err as Error)
+			}
+			return
+		}
+
+		if (creds.pairingCode || linkCodePairingActive) {
+			logger.info('pair-device IQ during link-code pairing — skipping QR ref timer')
+			return
+		}
+
 		const pairDeviceNode = getBinaryNodeChild(stanza, 'pair-device')
 		const refNodes = getBinaryNodeChildren(pairDeviceNode, 'ref')
 		const noiseKeyB64 = Buffer.from(creds.noiseKey.public).toString('base64')
@@ -902,8 +924,17 @@ export const makeSocket = (config: SocketConfig) => {
 				return
 			}
 
+			if (creds.pairingCode || linkCodePairingActive) {
+				logger.info('link-code pairing active — not consuming QR refs')
+				return
+			}
+
 			const refNode = refNodes.shift()
 			if (!refNode) {
+				if (creds.pairingCode || linkCodePairingActive) {
+					logger.info('QR refs exhausted but link-code pairing active — keeping connection open')
+					return
+				}
 				void end(new Boom('QR refs attempts ended', { statusCode: DisconnectReason.timedOut }))
 				return
 			}
@@ -911,10 +942,10 @@ export const makeSocket = (config: SocketConfig) => {
 			const ref = (refNode.content as Buffer).toString('utf-8')
 			const qr = buildPairingQRData(ref, noiseKeyB64, identityKeyB64, advB64, browser)
 
-			ev.emit('connection.update', { qr })
-
 			qrTimer = setTimeout(genPairQR, qrMs)
 			qrMs = qrTimeout || 20_000 // shorter subsequent qrs
+
+			ev.emit('connection.update', { qr })
 		}
 
 		genPairQR()
